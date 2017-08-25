@@ -1,27 +1,21 @@
 package reactivemongo.akkastream
 
-import scala.concurrent.{ ExecutionContext, Future }
-
+import scala.concurrent.{ ExecutionContext, Future, Promise }
 import scala.util.{ Failure, Success, Try }
-
 import akka.stream.{ Attributes, Outlet, SourceShape }
-import akka.stream.stage.{ GraphStage, GraphStageLogic, OutHandler }
+import akka.stream.stage.{ GraphStageLogic, GraphStageWithMaterializedValue, OutHandler }
+import reactivemongo.core.protocol.{ ReplyDocumentIteratorExhaustedException, Response }
+import reactivemongo.api.{ Cursor, CursorOps }
+import Cursor.{ Cont, Done, ErrorHandler, Fail }
 
-import reactivemongo.core.protocol.{
-  ReplyDocumentIteratorExhaustedException,
-  Response
-}
-import reactivemongo.api.{
-  Cursor,
-  CursorOps
-}, Cursor.{ Cont, Done, ErrorHandler, Fail }
+import scala.concurrent.duration.DurationDouble
 
 private[akkastream] class DocumentStage[T](
   cursor: AkkaStreamCursorImpl[T],
   maxDocs: Int,
   err: ErrorHandler[Option[T]]
 )(implicit ec: ExecutionContext)
-    extends GraphStage[SourceShape[T]] {
+    extends GraphStageWithMaterializedValue[SourceShape[T], Future[State]] {
 
   override val toString = "ReactiveMongoDocument"
   val out: Outlet[T] = Outlet(s"${toString}.out")
@@ -33,11 +27,14 @@ private[akkastream] class DocumentStage[T](
   )
 
   @inline
-  private def nextR(r: Response): Future[Option[Response]] =
+  private def nextR(r: Response): Future[Option[Response]] = {
     nextResponse(ec, r)
+  }
 
-  def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new GraphStageLogic(shape) with OutHandler {
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[State]) = {
+    val shutdownPromise = Promise[State]
+
+    (new GraphStageLogic(shape) with OutHandler {
       private var last = Option.empty[(Response, Iterator[T], Option[T])]
 
       @inline private def tailable = cursor.wrappee.tailable
@@ -133,8 +130,10 @@ private[akkastream] class DocumentStage[T](
 
         case Success(resp @ Some(r)) => {
           if (r.reply.numberReturned == 0) {
-            if (tailable) onPull()
-            else completeStage()
+            if (tailable) {
+              logger.debug("===== 0 Doc reply onPull =========")
+              getAsyncCallback[Unit](_ => onPull()).invoke(())
+            } else completeStage()
           } else {
             last = None
 
@@ -150,8 +149,10 @@ private[akkastream] class DocumentStage[T](
 
         case _ => {
           last = None
-          Thread.sleep(1000) // TODO
-          onPull()
+          materializer.scheduleOnce(2 second, () => getAsyncCallback[Unit]({ _ =>
+            logger.debug("===== Periodical onPull =========")
+            onPull()
+          }).invoke(()))
         }
       }
 
@@ -159,20 +160,24 @@ private[akkastream] class DocumentStage[T](
         case Some((r, bulk, _)) if (bulk.hasNext) =>
           nextD(r, bulk)
 
-        case _ if (tailable && !cursor.wrappee.connection.active) => {
+        case _ if (tailable && (!cursor.wrappee.connection.active || shutdownPromise.isCompleted)) => {
           // Complete tailable source if the connection is no longer active
           completeStage()
         }
 
         case _ =>
+          if (shutdownPromise.isCompleted)
+            logger.warn("REQUEST AFTER SHUTDOWN")
           request().onComplete(futureCB)
       }
 
       override def postStop(): Unit = {
         killLast()
         super.postStop()
+        shutdownPromise.tryCompleteWith(State.materialized)
       }
 
       setHandler(out, this)
-    }
+    }, shutdownPromise.future)
+  }
 }

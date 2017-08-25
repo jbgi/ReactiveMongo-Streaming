@@ -23,5 +23,6 @@ package object akkastream {
 
     def flatten[T](future: Future[AkkaStreamCursor[T]]): AkkaStreamCursor[T] =
       new AkkaStreamFlattenedCursor(future)
+
   }
 }

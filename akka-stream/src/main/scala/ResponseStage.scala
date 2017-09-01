@@ -27,8 +27,6 @@ private[akkastream] class ResponseStage[T, Out](
     "reactivemongo.akkastream.ResponseStage"
   )
 
-  @inline
-  private def next(r: Response): Future[Option[Response]] = nextResponse(ec, r)
 
   def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[State]) = {
 
@@ -39,38 +37,50 @@ private[akkastream] class ResponseStage[T, Out](
 
       private var last = Option.empty[(Response, Out)]
 
+      // Hook so that we only kill cursor _after_ currently running request has finished,
+      // to avoid spurious errors in logs.
+      private var lastRequest: Future[_] = Future.successful(())
+
       private var request: () => Future[Option[Response]] = { () =>
-        cursor.makeRequest(maxDocs).andThen {
+        val req = cursor.makeRequest(maxDocs)
+        lastRequest = req
+        req.andThen {
           case Success(_) => {
             request = { () =>
               last.fold(Future.successful(Option.empty[Response])) {
-                case (lastResponse, _) => next(lastResponse).andThen {
+                case (lastResponse, _) =>
+
+                  val next = nextResponse(ec, lastResponse).andThen {
                   case Success(Some(response)) => last.foreach {
                     case (lr, _) =>
                       if (lr.reply.cursorID != response.reply.cursorID) kill(lr)
                   }
                 }
+                  lastRequest = next
+                  next
               }
             }
           }
         }.map(Some(_))
       }
 
-      private def killLast(): Unit = last.foreach {
+      private def killLast(): Future[_] = last.foreach {
         case (r, _) => kill(r)
       }
 
       @SuppressWarnings(Array("CatchException"))
-      private def kill(r: Response): Unit = {
-        try {
-          cursor.wrappee kill r.reply.cursorID
-        } catch {
-          case reason: Exception => logger.warn(
-            s"fails to kill the cursor (${r.reply.cursorID})", reason
-          )
-        }
-
+      private def kill(r: Response): Future[_] = {
         last = None
+        // wait for last request to finish before
+        lastRequest.andThen { case _ =>
+          try {
+            cursor.wrappee kill r.reply.cursorID
+          } catch {
+            case reason: Exception => logger.warn(
+              s"fails to kill the cursor (${r.reply.cursorID})", reason
+            )
+          }
+        }
       }
 
       private def onFailure(reason: Throwable): Unit = {
@@ -121,7 +131,9 @@ private[akkastream] class ResponseStage[T, Out](
           }
         }).invoke _
 
-      def onPull(): Unit = request().onComplete(futureCB)
+      override def onPull(): Unit = request().onComplete(futureCB)
+
+      override def onDownstreamFinish(): Unit = stop()
 
       override def postStop(): Unit = {
         killLast()

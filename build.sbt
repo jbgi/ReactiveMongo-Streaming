@@ -4,7 +4,7 @@ import Dependencies._
 
 organization in ThisBuild := "org.reactivemongo"
 
-scalaVersion in ThisBuild := "2.12.3"
+scalaVersion in ThisBuild := "2.11.11"
 
 crossScalaVersions in ThisBuild := Seq("2.11.11", scalaVersion.value)
 

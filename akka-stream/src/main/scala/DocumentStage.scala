@@ -32,10 +32,6 @@ private[akkastream] class DocumentStage[T](
     "reactivemongo.akkastream.DocumentStage"
   )
 
-  @inline
-  private def nextR(r: Response): Future[Option[Response]] =
-    nextResponse(ec, r)
-
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[State]) = {
 
     val shutdownPromise = Promise[State]
@@ -43,58 +39,57 @@ private[akkastream] class DocumentStage[T](
     (new GraphStageLogic(shape) with OutHandler {
       private var count: Long = 0L
 
-      private var last = Option.empty[(Response, Iterator[T], Option[T])]
+      private var last = Option.empty[T]
+
+      // Hook so that we only kill cursor _after_ currently running request has finished,
+      // to avoid spurious errors in logs.
+      private var lastSuccessfulResponse: Future[Option[Response]] = Future.successful(None)
 
       @inline private def tailable = cursor.wrappee.tailable
 
-      private var request: () => Future[Option[Response]] = { () =>
-        cursor.makeRequest(maxDocs).andThen {
-          case Success(r) if (
-            tailable && r.reply.numberReturned > 0
-          ) => onFirst()
-
-          case Success(_) if (!tailable) => onFirst()
-        }.map(Some(_))
-      }
-
-      private def onFirst(): Unit = {
-        request = { () =>
-          last.fold(Future.successful(Option.empty[Response])) {
-            case (lastResponse, _, _) => nextR(lastResponse).andThen {
-              case Success(Some(response)) => last.foreach {
-                case (lr, _, _) =>
-                  if (lr.reply.cursorID != response.reply.cursorID) kill(lr)
-              }
-            }
+      private def request(): Future[Option[Response]] = {
+        val lastSuccessFull = lastSuccessfulResponse
+        val p = Promise[Option[Response]]
+        lastSuccessfulResponse = p.future
+        lastSuccessFull.flatMap { lastSuccessfulResp =>
+          val req = lastSuccessfulResp.fold(cursor.makeRequest(maxDocs).map[Option[Response]](Some(_)))(nextResponse(ec, _))
+          req.onComplete {
+            case Success(response) =>
+              if (response.isEmpty)
+                lastSuccessfulResp.foreach(kill)
+              p.success(response)
+            case _ =>
+              p.success(lastSuccessfulResp)
           }
+          req
         }
       }
 
-      private def killLast(): Unit = last.foreach {
-        case (r, _, _) =>
-          kill(r)
+
+      private def killLastAndCompletePromise(s: State): Future[Option[Response]] = {
+        lastSuccessfulResponse = lastSuccessfulResponse.map { r =>
+          r.foreach(kill)
+          shutdownPromise.success(s)
+          None
+        }
+        lastSuccessfulResponse
       }
 
       @SuppressWarnings(Array("CatchException"))
       private def kill(r: Response): Unit = {
-        try {
-          cursor.wrappee kill r.reply.cursorID
-        } catch {
-          case reason: Exception => logger.warn(
-            s"fails to kill the cursor (${r.reply.cursorID})", reason
-          )
+          try {
+            cursor.wrappee kill r.reply.cursorID
+          } catch {
+            case reason: Exception => logger.warn(
+              s"fails to kill the cursor (${r.reply.cursorID})", reason
+            )
+          }
         }
 
-        last = None
-      }
-
       private def onFailure(reason: Throwable): Unit = {
-        val previous = last.flatMap(_._3)
-
-        err(previous, reason) match {
+        err(last, reason) match {
           case Cursor.Cont(_) =>
-            ()
-            killLast()
+            last = None
           case Cursor.Fail(error) =>
             fail(error)
           case Cursor.Done(_) =>
@@ -103,20 +98,17 @@ private[akkastream] class DocumentStage[T](
       }
 
       private def stop(): Unit = {
-        killLast()
-        shutdownPromise.success(State.Successful(count))
+        killLastAndCompletePromise(State.Successful(count))
         completeStage()
       }
 
       private def stopWithError(reason: Throwable): Unit = {
-        killLast()
-        shutdownPromise.success(State.Failed(count, reason))
+        killLastAndCompletePromise(State.Failed(count, reason))
         completeStage()
       }
 
       private def fail(reason: Throwable): Unit = {
-        killLast()
-        shutdownPromise.success(State.Failed(count, reason))
+        killLastAndCompletePromise(State.Failed(count, reason))
         failStage(reason)
       }
 
@@ -173,7 +165,7 @@ private[akkastream] class DocumentStage[T](
           }
         }
 
-        case Success(None) if (!tailable) =>
+        case Success(None) =>
           stop()
 
         case _ => {
@@ -183,7 +175,7 @@ private[akkastream] class DocumentStage[T](
         }
       }
 
-      def onPull(): Unit = last match {
+      override def onPull(): Unit = last match {
         case Some((r, bulk, _)) if (bulk.hasNext) =>
           nextD(r, bulk)
 
@@ -196,9 +188,13 @@ private[akkastream] class DocumentStage[T](
           request().onComplete(futureCB)
       }
 
+      override def onDownstreamFinish(): Unit = stop()
+
       override def postStop(): Unit = {
-        killLast()
-        shutdownPromise.trySuccess(State.Successful(count))
+        lastSuccessfulResponse.map { r =>
+          r.foreach(kill)
+          shutdownPromise.trySuccess(State.Successful(count))
+        }
         super.postStop()
       }
 
